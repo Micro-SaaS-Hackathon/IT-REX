@@ -1,7 +1,7 @@
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 
-// A simple model for our data. You can replace this with your own model.
+// A simple model for our data.
 class Task {
   final int? id;
   final String title;
@@ -49,7 +49,8 @@ class DatabaseService {
   Future<Database> _initDb() async {
     // Get a location using `getDatabasesPath()` and join it with a database name.
     final databasePath = await getDatabasesPath();
-    final path = join(databasePath, 'task_database.db');
+    // 💡 The corrected database name
+    final path = join(databasePath, 'medscan_database.db');
 
     // Open the database and create a table if it doesn't exist.
     return openDatabase(
@@ -108,5 +109,10 @@ class DatabaseService {
       where: 'id = ?',
       whereArgs: [id],
     );
+  }
+
+  Future<void> deleteAllTasks() async {
+    final db = await database;
+    await db.delete('tasks');
   }
 }

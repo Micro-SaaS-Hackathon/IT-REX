@@ -8,6 +8,9 @@ import 'package:speech_to_text/speech_to_text.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
+import 'loading_page.dart';
+import 'pages/personal_info_page.dart';
+import 'services/personal_info_service.dart';
 
 // A simple model for our data.
 class Task {
@@ -130,7 +133,7 @@ class MyApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
         useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'MedScan'),
+      home: const LoadingPage(),
     );
   }
 }
@@ -149,6 +152,10 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
   File? _selectedImage;
   Uint8List? _imageBytes;
 
+  // AI variables
+  String _geminiResponse = 'Select an image or speak about your symptoms to get AI analysis.';
+  final PersonalInfoService _personalInfo = PersonalInfoService();
+
   // Voice variables
   final SpeechToText _speechToText = SpeechToText();
   bool _speechEnabled = false;
@@ -163,9 +170,6 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
   // New state variables for selection mode
   bool _isSelectionMode = false;
   final Set<int> _selectedTaskIds = {};
-
-  // AI response variables
-  String _geminiResponse = 'Select an image or speak about your symptoms to get AI analysis.';
 
   // Separate loading states for each tab
   bool _isImageLoading = false;
@@ -194,6 +198,9 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
         _loadHistory();
       }
     });
+
+    // Load personal information
+    _personalInfo.loadPersonalInfo();
 
     _initializeSpeech();
     _loadHistory();
@@ -326,11 +333,63 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
         ),
       );
 
+      // Get personal medical context
+      final String personalContext = _personalInfo.getPersonalContext();
+
       // The enhanced prompt for image analysis
-      const String enhancedPrompt =
-          'Examine this image carefully and provide a detailed analysis. '
-          'If it appears to be related to health or medicine—such as showing symptoms, physical conditions, medications, medical devices, or diagnostic results—describe what you observe in clinical terms, explain possible general implications, and advise the user to consult a licensed healthcare professional for proper diagnosis and treatment. '
-          'If the image is not medically related, provide a thorough description of all visual elements, including objects, people, setting, and other notable details, using precise and objective observations.';
+      final String enhancedPrompt =
+          '${personalContext}Provide a patient-friendly analysis (maximum 300 words). Use personal context internally.\n\n'
+          'Structure the response in these sections:\n\n'
+          '1. What Looks Good (in simple terms):\n'
+          '   - Normal findings\n'
+          '   - Healthy signs\n\n'
+          '2. Areas of Concern (explained simply):\n'
+          '   - Things that need attention\n'
+          '   - Changes to watch\n\n'
+          '3. Prevention Tips:\n'
+          '   - Lifestyle recommendations\n'
+          '   - Diet and exercise advice\n'
+          '   - Daily habits to maintain health\n'
+          '   - Ways to avoid complications\n\n'
+          '4. Next Steps:\n'
+          '   - What to do next\n'
+          '   - When to seek care\n'
+          '   - Self-care measures\n\n'
+          '2. Primary anatomical area - specific organ/body part involved\n'
+          '3. Abnormal values/results - high blood sugar, elevated BP, abnormal heart rate\n'
+          '4. Asymmetry - differences between left/right structures\n'
+          '5. Color & skin changes - redness, pallor, cyanosis, bruising\n'
+          '6. Swelling/edema - location, severity, symmetry\n'
+          '7. Lesion characteristics - size, shape, color, margins\n'
+          '8. Abnormal movement/posture - tremors, limping, guarding\n'
+          '9. Pain/discomfort signs - facial expressions, protective gestures\n'
+          '10. Medical devices - placement, misuse, complications\n'
+          '11. Medications/topicals - visible misuse, contraindications\n'
+          '12. Infection/inflammation - redness, pus, warmth, oozing\n'
+          '13. Wounds/surgical sites - size, depth, healing status\n'
+          '14. Diagnostic results - abnormal labs (high/low values), concerning scan findings\n'
+          '15. Environmental risks - hygiene issues, exposure hazards\n'
+          '16. Image quality issues - poor lighting, blur, incomplete views\n'
+          '17. Duration assessment - acute symptoms vs chronic conditions\n'
+          '18. Systemic implications - broader health impacts\n'
+          '19. Risk assessment - immediate threats or progression\n'
+          '20. Recommended actions - urgency for consultation\n\n'
+          'When mentioning medications:\n'
+          '- Explain in simple terms what they do\n'
+          '- List main side effects to watch for\n'
+          '- Mention who should be careful with this medication\n\n'
+          'Medical Terms Guide:\n'
+          '- Include a simple explanation for any medical terms used\n'
+          '- Use everyday language where possible\n\n'
+          'Long-term Health Tips:\n'
+          '- Suggest preventive screenings\n'
+          '- Recommend healthy lifestyle changes\n'
+          '- Include early warning signs to watch for\n'
+          '- Mention risk factors to avoid\n\n'
+          'For non-medical content:\n'
+          'Provide objective description (objects, setting, features)\n\n'
+          'IMPORTANT: This is general advice only, not a diagnosis.\n'
+          'Please consult a licensed healthcare professional for proper evaluation.';
 
       final content = [
         google_ai.Content.multi([
@@ -384,10 +443,15 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
         ),
       );
 
+      // Get personal medical context
+      final String personalContext = _personalInfo.getPersonalContext();
+
       final content = [
         google_ai.Content.text(
             'You are a helpful medical AI assistant. A patient has described their symptoms as follows: "${_wordsSpoken}"\n\n'
-            'Please provide helpful information about what these symptoms might indicate, possible causes, and general advice. '
+            '${personalContext}'
+            'Please provide helpful information about what these symptoms might indicate, possible causes, and general advice, '
+            'taking into account any allergies or medical history provided above. '
             'Always remind the user that this is not a substitute for professional medical diagnosis and they should consult with healthcare professionals for proper evaluation and treatment. '
             'Be empathetic and supportive in your response.'),
       ];
@@ -488,7 +552,31 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
     return Scaffold(
       appBar: AppBar(
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        title: Text(widget.title),
+        title: Row(
+          children: [
+            Image.asset(
+              'assets/images/medscan.png',
+              width: 30,  // Small icon size
+              height: 30,
+            ),
+            const SizedBox(width: 8),  // Space between icon and text
+            Text(widget.title),
+          ],
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.person),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (context) => const PersonalInfoPage(),
+                ),
+              );
+            },
+            tooltip: 'Personal Information',
+          ),
+        ],
         elevation: 2,
         bottom: TabBar(
           controller: _tabController,
@@ -819,6 +907,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
               ),
               Row(
                 children: [
+                  // This button only appears when you have selected at least one item.
                   if (_isSelectionMode && _selectedTaskIds.isNotEmpty)
                     ElevatedButton.icon(
                       onPressed: _deleteSelectedTasks,
@@ -833,6 +922,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                       ),
                     ),
                   const SizedBox(width: 8),
+                  // This button toggles selection mode.
                   ElevatedButton.icon(
                     onPressed: () {
                       setState(() {
@@ -901,12 +991,11 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                                   overflow: TextOverflow.ellipsis,
                                 ),
                                 isThreeLine: true,
-                                trailing: !_isSelectionMode
-                                    ? IconButton(
-                                        icon: const Icon(Icons.delete, color: Colors.red),
-                                        onPressed: () => _deleteTask(task.id!),
-                                      )
-                                    : null, // Hide the delete button in selection mode
+                                // **MODIFICATION HERE:** The delete button is now always visible.
+                                trailing: IconButton(
+                                  icon: const Icon(Icons.delete, color: Colors.red),
+                                  onPressed: () => _deleteTask(task.id!),
+                                ),
                                 onTap: _isSelectionMode
                                     ? () {
                                         setState(() {
