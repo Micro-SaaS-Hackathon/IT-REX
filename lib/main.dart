@@ -103,6 +103,16 @@ class DatabaseService {
     final db = await database;
     await db.delete('tasks');
   }
+
+  // Delete a single task by its ID.
+  Future<void> deleteTask(int id) async {
+    final db = await database;
+    await db.delete(
+      'tasks',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
 }
 
 void main() {
@@ -150,9 +160,13 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
   final DatabaseService _dbService = DatabaseService();
   List<Task> _history = [];
 
+  // New state variables for selection mode
+  bool _isSelectionMode = false;
+  final Set<int> _selectedTaskIds = {};
+
   // AI response variables
   String _geminiResponse = 'Select an image or speak about your symptoms to get AI analysis.';
-  
+
   // Separate loading states for each tab
   bool _isImageLoading = false;
   bool _isVoiceLoading = false;
@@ -170,7 +184,11 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
     super.initState();
     _tabController = TabController(length: 3, vsync: this);
     _tabController.addListener(() {
-      setState(() {});
+      setState(() {
+        // Reset selection mode when switching tabs
+        _isSelectionMode = false;
+        _selectedTaskIds.clear();
+      });
       // Load history when the history tab is selected
       if (_tabController.index == 2) {
         _loadHistory();
@@ -434,11 +452,35 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
       _wordsSpoken = '';
       _confidenceLevel = 0;
       _geminiResponse = 'Select an image or speak about your symptoms to get AI analysis.';
+      _isSelectionMode = false;
+      _selectedTaskIds.clear();
     });
     // Clear history from the database
     _dbService.deleteAllTasks().then((_) {
       _loadHistory();
     });
+  }
+
+  // Function to delete a single analysis entry.
+  Future<void> _deleteTask(int id) async {
+    await _dbService.deleteTask(id);
+    _loadHistory();
+  }
+
+  // Function to delete selected tasks.
+  Future<void> _deleteSelectedTasks() async {
+    setState(() {
+      _isHistoryLoading = true;
+    });
+    for (int id in _selectedTaskIds) {
+      await _dbService.deleteTask(id);
+    }
+    setState(() {
+      _isSelectionMode = false;
+      _selectedTaskIds.clear();
+      _isHistoryLoading = false;
+    });
+    _loadHistory();
   }
 
   @override
@@ -767,9 +809,48 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
       padding: const EdgeInsets.all(16.0),
       child: Column(
         children: [
-          Text(
-            'Analysis History',
-            style: Theme.of(context).textTheme.headlineSmall,
+          // Header with action buttons
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'Analysis History',
+                style: Theme.of(context).textTheme.headlineSmall,
+              ),
+              Row(
+                children: [
+                  if (_isSelectionMode && _selectedTaskIds.isNotEmpty)
+                    ElevatedButton.icon(
+                      onPressed: _deleteSelectedTasks,
+                      icon: const Icon(Icons.delete),
+                      label: const Text('Delete Selected'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.red.shade100,
+                        foregroundColor: Colors.red.shade700,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                      ),
+                    ),
+                  const SizedBox(width: 8),
+                  ElevatedButton.icon(
+                    onPressed: () {
+                      setState(() {
+                        _isSelectionMode = !_isSelectionMode;
+                        _selectedTaskIds.clear();
+                      });
+                    },
+                    icon: Icon(_isSelectionMode ? Icons.done : Icons.select_all),
+                    label: Text(_isSelectionMode ? 'Done' : 'Select'),
+                    style: ElevatedButton.styleFrom(
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ),
           const SizedBox(height: 16),
           _isHistoryLoading
@@ -790,11 +871,25 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                           itemCount: _history.length,
                           itemBuilder: (context, index) {
                             final task = _history[index];
+                            final isSelected = _selectedTaskIds.contains(task.id);
                             return Card(
                               elevation: 2,
                               margin: const EdgeInsets.symmetric(vertical: 8),
                               child: ListTile(
-                                leading: const Icon(Icons.description, color: Colors.deepPurple),
+                                leading: _isSelectionMode
+                                    ? Checkbox(
+                                        value: isSelected,
+                                        onChanged: (bool? value) {
+                                          setState(() {
+                                            if (value == true) {
+                                              _selectedTaskIds.add(task.id!);
+                                            } else {
+                                              _selectedTaskIds.remove(task.id);
+                                            }
+                                          });
+                                        },
+                                      )
+                                    : const Icon(Icons.description, color: Colors.deepPurple),
                                 title: Text(
                                   task.title.split('. ')[0] + (task.title.split('. ').length > 1 ? '...' : ''),
                                   maxLines: 1,
@@ -806,25 +901,44 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                                   overflow: TextOverflow.ellipsis,
                                 ),
                                 isThreeLine: true,
+                                trailing: !_isSelectionMode
+                                    ? IconButton(
+                                        icon: const Icon(Icons.delete, color: Colors.red),
+                                        onPressed: () => _deleteTask(task.id!),
+                                      )
+                                    : null, // Hide the delete button in selection mode
+                                onTap: _isSelectionMode
+                                    ? () {
+                                        setState(() {
+                                          if (isSelected) {
+                                            _selectedTaskIds.remove(task.id);
+                                          } else {
+                                            _selectedTaskIds.add(task.id!);
+                                          }
+                                        });
+                                      }
+                                    : null,
                               ),
                             );
                           },
                         ),
                 ),
           const SizedBox(height: 16),
-          ElevatedButton.icon(
-            onPressed: _isHistoryLoading ? null : _clearAll,
-            icon: const Icon(Icons.delete_forever),
-            label: const Text('Clear All History'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red.shade100,
-              foregroundColor: Colors.red.shade700,
-              minimumSize: const Size.fromHeight(50),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
+          // Keep the "Clear All" button for convenience outside of selection mode
+          if (!_isSelectionMode)
+            ElevatedButton.icon(
+              onPressed: _isHistoryLoading ? null : _clearAll,
+              icon: const Icon(Icons.delete_forever),
+              label: const Text('Clear All History'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.red.shade100,
+                foregroundColor: Colors.red.shade700,
+                minimumSize: const Size.fromHeight(50),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
               ),
             ),
-          ),
         ],
       ),
     );
