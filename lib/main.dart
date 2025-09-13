@@ -3,9 +3,107 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:google_generative_ai/google_generative_ai.dart' as google_ai;
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart' as p;
+
+// A simple model for our data.
+class Task {
+  final int? id;
+  final String title;
+  final bool isCompleted;
+
+  Task({
+    this.id,
+    required this.title,
+    this.isCompleted = false,
+  });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'title': title,
+      'isCompleted': isCompleted ? 1 : 0,
+    };
+  }
+
+  factory Task.fromMap(Map<String, dynamic> map) {
+    return Task(
+      id: map['id'],
+      title: map['title'],
+      isCompleted: map['isCompleted'] == 1,
+    );
+  }
+}
+
+// Database service to handle all local database operations.
+class DatabaseService {
+  // Use a singleton pattern to ensure only one instance of the database exists.
+  static final DatabaseService _instance = DatabaseService._internal();
+  factory DatabaseService() => _instance;
+  DatabaseService._internal();
+
+  static Database? _database;
+
+  Future<Database> get database async {
+    if (_database != null) {
+      return _database!;
+    }
+    _database = await _initDb();
+    return _database!;
+  }
+
+  Future<Database> _initDb() async {
+    final databasePath = await getDatabasesPath();
+    final path = p.join(databasePath, 'medscan_database.db');
+
+    return openDatabase(
+      path,
+      version: 1,
+      onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE tasks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            isCompleted INTEGER NOT NULL
+          )
+        ''');
+      },
+    );
+  }
+
+  // --- CRUD Operations ---
+
+  // Insert a task into the database.
+  Future<void> insertTask(Task task) async {
+    final db = await database;
+    await db.insert(
+      'tasks',
+      task.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  // Retrieve all tasks from the database.
+  Future<List<Task>> getTasks() async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      'tasks',
+      orderBy: 'id DESC', // Order by most recent first
+    );
+    return List.generate(maps.length, (i) {
+      return Task.fromMap(maps[i]);
+    });
+  }
+
+  // Delete all tasks.
+  Future<void> deleteAllTasks() async {
+    final db = await database;
+    await db.delete('tasks');
+  }
+}
 
 void main() {
   runApp(const MyApp());
@@ -40,21 +138,28 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
   // Image variables
   File? _selectedImage;
   Uint8List? _imageBytes;
-  
+
   // Voice variables
   final SpeechToText _speechToText = SpeechToText();
   bool _speechEnabled = false;
   bool _speechListening = false;
   String _wordsSpoken = '';
   double _confidenceLevel = 0;
-  
+
+  // Database variables
+  final DatabaseService _dbService = DatabaseService();
+  List<Task> _history = [];
+
   // AI response variables
   String _geminiResponse = 'Select an image or speak about your symptoms to get AI analysis.';
-  bool _isLoading = false;
   
+  // Separate loading states for each tab
+  bool _isImageLoading = false;
+  bool _isVoiceLoading = false;
+  bool _isHistoryLoading = false;
+
   // UI variables
   late TabController _tabController;
-  int _currentTabIndex = 0;
 
   final ImagePicker _picker = ImagePicker();
   // Your actual Gemini API key
@@ -63,15 +168,18 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
     _tabController.addListener(() {
-      setState(() {
-        _currentTabIndex = _tabController.index;
-      });
+      setState(() {});
+      // Load history when the history tab is selected
+      if (_tabController.index == 2) {
+        _loadHistory();
+      }
     });
-    
+
     _initializeSpeech();
-    
+    _loadHistory();
+
     if (_apiKey == 'YOUR_API_KEY_HERE' || _apiKey.isEmpty) {
       _geminiResponse = 'Please set your API key in the code.';
     }
@@ -83,11 +191,29 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
     super.dispose();
   }
 
+  Future<void> _loadHistory() async {
+    setState(() {
+      _isHistoryLoading = true;
+    });
+    final history = await _dbService.getTasks();
+    setState(() {
+      _history = history;
+      _isHistoryLoading = false;
+    });
+  }
+
+  Future<void> _saveAnalysis(String analysis) async {
+    if (analysis.isNotEmpty) {
+      await _dbService.insertTask(Task(title: analysis));
+      _loadHistory();
+    }
+  }
+
   // Initialize speech to text
   void _initializeSpeech() async {
     // Request microphone permission
     await Permission.microphone.request();
-    
+
     _speechEnabled = await _speechToText.initialize(
       onStatus: (status) {
         setState(() {
@@ -148,14 +274,14 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
           }
           _imageBytes = bytes;
           _geminiResponse = 'Analyzing image...';
-          _isLoading = true;
+          _isImageLoading = true;
         });
         _sendImageToGemini();
       }
     } catch (e) {
       setState(() {
         _geminiResponse = 'Error picking image: $e';
-        _isLoading = false;
+        _isImageLoading = false;
       });
     }
   }
@@ -165,16 +291,16 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
     if (_imageBytes == null) {
       setState(() {
         _geminiResponse = 'No image selected.';
-        _isLoading = false;
+        _isImageLoading = false;
       });
       return;
     }
 
     try {
-      final model = GenerativeModel(
+      final model = google_ai.GenerativeModel(
         model: 'gemini-2.5-flash-lite',
         apiKey: _apiKey,
-        generationConfig: GenerationConfig(
+        generationConfig: google_ai.GenerationConfig(
           temperature: 0.4,
           topK: 32,
           topP: 1,
@@ -183,15 +309,15 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
       );
 
       // The enhanced prompt for image analysis
-      const String enhancedPrompt = 
-        'Examine this image carefully and provide a detailed analysis. '
-        'If it appears to be related to health or medicine—such as showing symptoms, physical conditions, medications, medical devices, or diagnostic results—describe what you observe in clinical terms, explain possible general implications, and advise the user to consult a licensed healthcare professional for proper diagnosis and treatment. '
-        'If the image is not medically related, provide a thorough description of all visual elements, including objects, people, setting, and other notable details, using precise and objective observations.';
-      
+      const String enhancedPrompt =
+          'Examine this image carefully and provide a detailed analysis. '
+          'If it appears to be related to health or medicine—such as showing symptoms, physical conditions, medications, medical devices, or diagnostic results—describe what you observe in clinical terms, explain possible general implications, and advise the user to consult a licensed healthcare professional for proper diagnosis and treatment. '
+          'If the image is not medically related, provide a thorough description of all visual elements, including objects, people, setting, and other notable details, using precise and objective observations.';
+
       final content = [
-        Content.multi([
-          TextPart(enhancedPrompt),
-          DataPart('image/jpeg', _imageBytes!),
+        google_ai.Content.multi([
+          google_ai.TextPart(enhancedPrompt),
+          google_ai.DataPart('image/jpeg', _imageBytes!),
         ]),
       ];
 
@@ -199,12 +325,17 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
 
       setState(() {
         _geminiResponse = response.text ?? 'No response from the AI.';
-        _isLoading = false;
+        _isImageLoading = false;
       });
+
+      // Save the analysis to the database
+      if (response.text != null) {
+        _saveAnalysis(response.text!);
+      }
     } catch (e) {
       setState(() {
         _geminiResponse = 'Error: ${e.toString()}\n\nPlease check your API key and internet connection.';
-        _isLoading = false;
+        _isImageLoading = false;
       });
     }
   }
@@ -219,15 +350,15 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
     }
 
     setState(() {
-      _isLoading = true;
+      _isVoiceLoading = true;
       _geminiResponse = 'Analyzing your symptoms...';
     });
 
     try {
-      final model = GenerativeModel(
+      final model = google_ai.GenerativeModel(
         model: 'gemini-2.5-flash-lite',
         apiKey: _apiKey,
-        generationConfig: GenerationConfig(
+        generationConfig: google_ai.GenerationConfig(
           temperature: 0.4,
           topK: 32,
           topP: 1,
@@ -236,24 +367,28 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
       );
 
       final content = [
-        Content.text(
-          'You are a helpful medical AI assistant. A patient has described their symptoms as follows: "${_wordsSpoken}"\n\n'
-          'Please provide helpful information about what these symptoms might indicate, possible causes, and general advice. '
-          'Always remind the user that this is not a substitute for professional medical diagnosis and they should consult with healthcare professionals for proper evaluation and treatment. '
-          'Be empathetic and supportive in your response.'
-        ),
+        google_ai.Content.text(
+            'You are a helpful medical AI assistant. A patient has described their symptoms as follows: "${_wordsSpoken}"\n\n'
+            'Please provide helpful information about what these symptoms might indicate, possible causes, and general advice. '
+            'Always remind the user that this is not a substitute for professional medical diagnosis and they should consult with healthcare professionals for proper evaluation and treatment. '
+            'Be empathetic and supportive in your response.'),
       ];
 
       final response = await model.generateContent(content);
 
       setState(() {
         _geminiResponse = response.text ?? 'No response from the AI.';
-        _isLoading = false;
+        _isVoiceLoading = false;
       });
+
+      // Save the analysis to the database
+      if (response.text != null) {
+        _saveAnalysis(response.text!);
+      }
     } catch (e) {
       setState(() {
         _geminiResponse = 'Error: ${e.toString()}\n\nPlease check your API key and internet connection.';
-        _isLoading = false;
+        _isVoiceLoading = false;
       });
     }
   }
@@ -300,6 +435,10 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
       _confidenceLevel = 0;
       _geminiResponse = 'Select an image or speak about your symptoms to get AI analysis.';
     });
+    // Clear history from the database
+    _dbService.deleteAllTasks().then((_) {
+      _loadHistory();
+    });
   }
 
   @override
@@ -314,6 +453,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
           tabs: const [
             Tab(icon: Icon(Icons.image), text: 'Image Analysis'),
             Tab(icon: Icon(Icons.mic), text: 'Voice Analysis'),
+            Tab(icon: Icon(Icons.history), text: 'History'),
           ],
         ),
       ),
@@ -324,6 +464,8 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
           _buildImageAnalysisTab(),
           // Voice Analysis Tab
           _buildVoiceAnalysisTab(),
+          // History Tab
+          _buildHistoryTab(),
         ],
       ),
     );
@@ -392,7 +534,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                 borderRadius: BorderRadius.circular(12),
                 border: Border.all(color: Colors.grey.shade300),
               ),
-              child: _isLoading
+              child: _isImageLoading
                   ? const Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
@@ -415,7 +557,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
             children: [
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: _isLoading ? null : _showImageSourceDialog,
+                  onPressed: _isImageLoading ? null : _showImageSourceDialog,
                   icon: const Icon(Icons.add_a_photo),
                   label: const Text('Select Image'),
                   style: ElevatedButton.styleFrom(
@@ -429,7 +571,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
               const SizedBox(width: 12),
               if (_imageBytes != null)
                 ElevatedButton(
-                  onPressed: _isLoading ? null : _clearAll,
+                  onPressed: _isImageLoading ? null : _clearAll,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.red.shade100,
                     foregroundColor: Colors.red.shade700,
@@ -472,8 +614,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  _speechListening ? 'Listening...' : 
-                  (_speechEnabled ? 'Tap to speak about your symptoms' : 'Speech not available'),
+                  _speechListening ? 'Listening...' : (_speechEnabled ? 'Tap to speak about your symptoms' : 'Speech not available'),
                   style: Theme.of(context).textTheme.titleMedium,
                   textAlign: TextAlign.center,
                 ),
@@ -507,9 +648,9 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                   Text(
                     'What you said:',
                     style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                      color: Colors.blue.shade700,
-                      fontWeight: FontWeight.bold,
-                    ),
+                          color: Colors.blue.shade700,
+                          fontWeight: FontWeight.bold,
+                        ),
                   ),
                   const SizedBox(height: 8),
                   Text(
@@ -538,12 +679,12 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                   Text(
                     'AI Analysis:',
                     style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
+                          fontWeight: FontWeight.bold,
+                        ),
                   ),
                   const SizedBox(height: 12),
                   Expanded(
-                    child: _isLoading
+                    child: _isVoiceLoading
                         ? const Column(
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: [
@@ -571,7 +712,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
             children: [
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: _speechEnabled && !_isLoading
+                  onPressed: _speechEnabled && !_isVoiceLoading
                       ? (_speechListening ? _stopListening : _startListening)
                       : null,
                   icon: Icon(_speechListening ? Icons.mic_off : Icons.mic),
@@ -589,7 +730,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
               const SizedBox(width: 12),
               if (_wordsSpoken.isNotEmpty)
                 ElevatedButton.icon(
-                  onPressed: _isLoading ? null : _sendVoiceToGemini,
+                  onPressed: _isVoiceLoading ? null : _sendVoiceToGemini,
                   icon: const Icon(Icons.send),
                   label: const Text('Analyze'),
                   style: ElevatedButton.styleFrom(
@@ -603,7 +744,7 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                 ),
               const SizedBox(width: 12),
               ElevatedButton(
-                onPressed: _isLoading ? null : _clearAll,
+                onPressed: _isVoiceLoading ? null : _clearAll,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.orange.shade100,
                   foregroundColor: Colors.orange.shade700,
@@ -615,6 +756,74 @@ class _MyHomePageState extends State<MyHomePage> with TickerProviderStateMixin {
                 child: const Icon(Icons.clear),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHistoryTab() {
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Column(
+        children: [
+          Text(
+            'Analysis History',
+            style: Theme.of(context).textTheme.headlineSmall,
+          ),
+          const SizedBox(height: 16),
+          _isHistoryLoading
+              ? const Expanded(
+                  child: Center(
+                    child: CircularProgressIndicator(),
+                  ),
+                )
+              : Expanded(
+                  child: _history.isEmpty
+                      ? const Center(
+                          child: Text(
+                            'No history yet. Analyze an image or symptoms to save your first entry.',
+                            textAlign: TextAlign.center,
+                          ),
+                        )
+                      : ListView.builder(
+                          itemCount: _history.length,
+                          itemBuilder: (context, index) {
+                            final task = _history[index];
+                            return Card(
+                              elevation: 2,
+                              margin: const EdgeInsets.symmetric(vertical: 8),
+                              child: ListTile(
+                                leading: const Icon(Icons.description, color: Colors.deepPurple),
+                                title: Text(
+                                  task.title.split('. ')[0] + (task.title.split('. ').length > 1 ? '...' : ''),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                subtitle: Text(
+                                  task.title,
+                                  maxLines: 3,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                isThreeLine: true,
+                              ),
+                            );
+                          },
+                        ),
+                ),
+          const SizedBox(height: 16),
+          ElevatedButton.icon(
+            onPressed: _isHistoryLoading ? null : _clearAll,
+            icon: const Icon(Icons.delete_forever),
+            label: const Text('Clear All History'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.red.shade100,
+              foregroundColor: Colors.red.shade700,
+              minimumSize: const Size.fromHeight(50),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
           ),
         ],
       ),
